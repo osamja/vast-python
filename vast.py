@@ -4597,13 +4597,42 @@ def login(args):
     print(login_deprecated_message)
 """
 
+import readline
+
+def autocomplete(text, state):
+    commands = [
+        "help", "attach ssh", "cancel copy", "cancel sync", "change bid", "copy", "cloud copy",
+        "create api-key", "create ssh-key", "create autoscaler", "create endpoint", "create instance",
+        "create env-var", "create subaccount", "create team", "create team-role", "create template",
+        "delete api-key", "delete env-var", "delete ssh-key", "delete autoscaler", "delete endpoint",
+        "destroy instance", "destroy instances", "destroy team", "detach ssh", "execute",
+        "invite team-member", "label instance", "logs", "prepay instance", "reboot instance",
+        "recycle instance", "remove team-member", "remove team-role", "reports", "reset api-key",
+        "start instance", "start instances", "stop instance", "stop instances", "search benchmarks",
+        "search invoices", "search offers", "search templates", "set api-key", "set user", "ssh-url",
+        "scp-url", "show api-key", "show api-keys", "show ssh-keys", "show autoscalers", "show endpoints",
+        "show connections", "show deposit", "show earnings", "show invoices", "show instance",
+        "show instances", "show ipaddrs", "show user", "show subaccounts", "show env-vars",
+        "show team-members", "show team-role", "show team-roles", "transfer credit", "update autoscaler",
+        "update endpoint", "update team-role", "update env-var", "update ssh-key", "generate pdf-invoices",
+        "cleanup machine", "list machine", "list machines", "remove defjob", "set defjob", "set min-bid",
+        "schedule maint", "cancel maint", "show machines", "unlist machine", "launch instance"
+    ]
+    matches = [c for c in commands if c.startswith(text)]
+    return matches[state] if state < len(matches) else None
+
+def enable_autocomplete():
+    readline.set_completer(autocomplete)
+    readline.parse_and_bind("tab: complete")
+
 def main():
+    enable_autocomplete()
+    
     parser.add_argument("--url", help="server REST api url", default=server_url_default)
     parser.add_argument("--retry", help="retry limit", default=3)
     parser.add_argument("--raw", action="store_true", help="output machine-readable json")
     parser.add_argument("--explain", action="store_true", help="output verbose explanation of mapping of CLI calls to HTTPS API endpoints")
     parser.add_argument("--api-key", help="api key. defaults to using the one stored in {}".format(api_key_file_base), type=str, required=False, default=os.getenv("VAST_API_KEY", api_key_guard))
-
 
     args = parser.parse_args()
     if args.api_key is api_key_guard:
