@@ -4639,3 +4639,23 @@ if __name__ == "__main__":
     except (KeyboardInterrupt, BrokenPipeError):
         pass
 
+ 
+def cmd_show_instances(self, argv):
+    print('Hello World')
+    args = self.parser.parse_args(argv)
+
+    instances = self.api.show_instances()
+    if args.json:
+        print(json.dumps(instances, indent=2))
+    else:
+        # Format and display instances in tabular form
+        table_data = []
+        for instance in instances:
+            table_data.append([
+                instance['id'],
+                instance['status'],
+                instance['created_at'],
+                instance.get('template_name', 'N/A'),
+            ])
+        headers = ['ID', 'Status', 'Created At', 'Template']
+        print(tabulate(table_data, headers=headers))
