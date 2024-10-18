@@ -186,6 +186,10 @@ class apwrap(object):
                     pass
         return self.parser.add_argument(*a, **kw)
 
+    def show_instances(self, *args, **kwargs):
+        print('Hello World')
+        # Existing logic for show_instances would go here
+
     def subparsers(self, *a, **kw):
         if self.subparsers_ is None:
             kw["metavar"] = "command"
