@@ -18,6 +18,7 @@ import requests
 import getpass
 import subprocess
 from subprocess import PIPE
+import cmd
 
 try:
     from urllib import quote_plus  # Python 2.X
@@ -4625,14 +4626,86 @@ def enable_autocomplete():
     readline.set_completer(autocomplete)
     readline.parse_and_bind("tab: complete")
 
+class VastShell(cmd.Cmd):
+    intro = '''Welcome to the Vast.ai interactive shell. Type help or ? to list commands.
+Enter commands without the 'vastai' prefix. For example:
+  show instances
+  create instance 12345 --image ubuntu:latest
+'''
+    prompt = 'vast> '
+
+    def __init__(self, parser):
+        super().__init__()
+        self.parser = parser
+        # Store initial namespace args
+        self.base_args = None
+
+    def preloop(self):
+        # Parse any command line arguments that should persist
+        try:
+            self.base_args = self.parser.parse_args([])
+            if self.base_args.api_key is api_key_guard:
+                if os.path.exists(api_key_file):
+                    with open(api_key_file, "r") as reader:
+                        self.base_args.api_key = reader.read().strip()
+                else:
+                    self.base_args.api_key = None
+            if self.base_args.api_key:
+                headers["Authorization"] = "Bearer " + self.base_args.api_key
+        except Exception as e:
+            print(f"Warning: Error setting up base arguments: {e}")
+
+    def default(self, line):
+        """Handle commands by passing them to the argument parser"""
+        try:
+            if line.strip():  # Only process non-empty lines
+                args = self.parser.parse_args(line.split())
+                # Copy over persistent arguments
+                if self.base_args:
+                    for attr in ['url', 'retry', 'raw', 'explain', 'api_key']:
+                        if hasattr(self.base_args, attr):
+                            setattr(args, attr, getattr(self.base_args, attr))
+                args.func(args)
+        except SystemExit:
+            pass  # Catch the SystemExit to prevent the shell from closing
+        except Exception as e:
+            print(f"Error: {e}")
+
+    def do_exit(self, arg):
+        """Exit the Vast.ai interactive shell"""
+        print("Goodbye!")
+        return True
+
+    def do_quit(self, arg):
+        """Exit the Vast.ai interactive shell"""
+        return self.do_exit(arg)
+
+    def emptyline(self):
+        """Do nothing on empty line"""
+        pass
+
+    def help_help(self):
+        """Help message for the help command"""
+        print("List available commands with 'help' or detailed help with 'help cmd'.")
+
+# [Previous command definitions remain the same]
+# Include all the @parser.command decorated functions from the original vast.py here
+# (show__instances, create__instance, etc.)
+
 def main():
-    enable_autocomplete()
-    
     parser.add_argument("--url", help="server REST api url", default=server_url_default)
     parser.add_argument("--retry", help="retry limit", default=3)
     parser.add_argument("--raw", action="store_true", help="output machine-readable json")
     parser.add_argument("--explain", action="store_true", help="output verbose explanation of mapping of CLI calls to HTTPS API endpoints")
-    parser.add_argument("--api-key", help="api key. defaults to using the one stored in {}".format(api_key_file_base), type=str, required=False, default=os.getenv("VAST_API_KEY", api_key_guard))
+    parser.add_argument("--api-key", help="api key. defaults to using the one stored in {}".format(api_key_file_base), 
+                       type=str, required=False, default=os.getenv("VAST_API_KEY", api_key_guard))
+
+    # If no arguments are provided, enter interactive mode
+    if len(sys.argv) == 1:
+        # Initialize shell with parser
+        shell = VastShell(parser)
+        shell.cmdloop()
+        return
 
     args = parser.parse_args()
     if args.api_key is api_key_guard:
@@ -4648,23 +4721,16 @@ def main():
         sys.exit(args.func(args) or 0)
     except requests.exceptions.HTTPError as e:
         try:
-            errmsg = e.response.json().get("msg");
+            errmsg = e.response.json().get("msg")
         except JSONDecodeError:
             if e.response.status_code == 401:
                 errmsg = "Please log in or sign up"
             else:
                 errmsg = "(no detail message supplied)"
-        print("failed with error {e.response.status_code}: {errmsg}".format(**locals()));
-
-
-
-
-
-
+        print("failed with error {e.response.status_code}: {errmsg}".format(**locals()))
 
 if __name__ == "__main__":
     try:
         main()
     except (KeyboardInterrupt, BrokenPipeError):
         pass
-
