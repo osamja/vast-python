@@ -3,6 +3,8 @@
 
 from __future__ import unicode_literals, print_function
 
+import subprocess
+import threading
 import re
 import json
 import sys
@@ -1123,7 +1125,6 @@ def install_docker_compose(ssh_host, ssh_port):
         
         success = False
         for method_commands in install_methods:
-            print(f"Trying installation method...")
             
             # Run installation commands
             install_cmd = " && ".join(method_commands)
@@ -1419,6 +1420,7 @@ def format_instance_details(offer):
     gpu_name = offer.get('gpu_name', 'Unknown GPU')
     num_gpus = offer.get('num_gpus', 0)
     cuda_max_good = offer.get('cuda_max_good', 'Unknown')
+    location = offer.get("geolocation", "Unknown")
     disk_space = offer.get('disk_space', 0)
     cpu_cores = offer.get('cpu_cores', 0)
     cpu_ram = offer.get('cpu_ram', 0)
@@ -1426,6 +1428,7 @@ def format_instance_details(offer):
     dph = offer.get('dph_total', 0)
     
     return (f"GPU: {gpu_name} (x{num_gpus})\n"
+            f"Location: {location}\n"
             f"CUDA: {cuda_max_good}\n"
             f"Storage: {disk_space:.1f}GB\n"
             f"CPU Cores: {cpu_cores}\n"
@@ -1755,15 +1758,41 @@ def magic_deploy(args):
         test_cmd = f"ssh {ssh_opts} -p {ssh_port} root@{ssh_host} 'docker compose version >/dev/null 2>&1 || docker-compose --version >/dev/null 2>&1'"
         returncode, _, _ = run_command(test_cmd)
         
-        # Choose the appropriate command based on what's available
         if returncode == 0:
-            # Try modern syntax first, fall back to legacy if needed
-            cmd = f"cd {src_directory} && (docker compose up -d || docker-compose up -d)"
+            # Use subprocess.Popen to stream output
+            cmd = f"cd {args.copy_dest} && (docker compose up -d && docker compose logs -f --until=1s || docker-compose up -d && docker-compose logs -f --until=1s)"
+            ssh_cmd = ["ssh", *ssh_opts.split(), "-p", str(ssh_port), f"root@{ssh_host}", cmd]
+            
+            print("Running Docker Compose with streaming output. This may take a while...")
+            process = subprocess.Popen(
+                ssh_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+                bufsize=1
+            )
+            
+            # Create threads to handle stdout and stderr streaming
+            def stream_output(stream, prefix=''):
+                for line in stream:
+                    print(f"{prefix}{line}", end='')
+            
+            stdout_thread = threading.Thread(target=stream_output, args=(process.stdout,))
+            stderr_thread = threading.Thread(target=stream_output, args=(process.stderr,))
+            
+            stdout_thread.start()
+            stderr_thread.start()
+            
+            # Wait for the process to complete
+            returncode = process.wait()
+            
+            # Wait for output threads to complete
+            stdout_thread.join()
+            stderr_thread.join()
         else:
             print("Warning: Neither docker compose nor docker-compose seems to be working properly")
             return 1
             
-        print(f"Running Docker Compose: {cmd}")
     else:
         # If we have detected ports, map them all
         port_flags = " ".join([f"-p {port}:{port}" for port in ports]) if ports else ""
