@@ -987,35 +987,22 @@ def run_command(cmd: str) -> tuple[int, str, str]:
     stdout, stderr = process.communicate()
     return process.returncode, stdout, stderr
 
-def create_instance_with_retry(args, offers, env, max_retries=3):
+def create_instance_with_retry(args, offer, env, max_retries=3):
     """
     Attempt to create an instance with retry logic if VM creation fails.
     
     Args:
         args: Command line arguments
-        offers: List of available instance offers
+        offer: Single instance offer to create
         env: Environment variables and port mappings
         max_retries: Maximum number of retry attempts
         
     Returns:
-        tuple: (instance_id, ssh_host, ssh_port) if successful, (None, None, None) if all attempts fail
+        tuple: (instance_id, ssh_host, ssh_port, instance) if successful, (None, None, None, None) if all attempts fail
     """
-    tried_instances = set()
+    instance_id = offer["id"]
     
     for attempt in range(max_retries):
-        # Filter out previously tried instances
-        available_offers = [offer for offer in offers if offer["id"] not in tried_instances]
-        
-        if not available_offers:
-            print("No more available instances to try")
-            return None, None, None
-            
-        # Select random instance from remaining offers
-        import random
-        instance = random.choice(available_offers)
-        instance_id = instance["id"]
-        tried_instances.add(instance_id)
-        
         print(f"Attempt {attempt + 1}/{max_retries}: Creating instance {instance_id}...")
         
         # Create instance
@@ -1080,9 +1067,9 @@ def create_instance_with_retry(args, offers, env, max_retries=3):
             status_checks += 1
             time.sleep(5)
             
-        print(f"Instance {instance_id} failed to start properly, trying another instance...")
+        print(f"Instance {instance_id} failed to start properly, retrying...")
         
-        # Destroy failed instance before trying next one
+        # Destroy failed instance before next attempt
         url = apiurl(args, f"/instances/{instance_id}")
         try:
             r = http_del(args, url, headers={})
@@ -1418,6 +1405,102 @@ def clean_compose_file(compose_path, output_path=None):
         yaml.dump(cleaned_data, f, default_flow_style=False)
     
     return final_path
+def format_instance_details(offer):
+    """Format instance details for display in TUI."""
+    gpu_name = offer.get('gpu_name', 'Unknown GPU')
+    num_gpus = offer.get('num_gpus', 0)
+    cuda_max_good = offer.get('cuda_max_good', 'Unknown')
+    disk_space = offer.get('disk_space', 0)
+    cpu_cores = offer.get('cpu_cores', 0)
+    cpu_ram = offer.get('cpu_ram', 0)
+    reliability = offer.get('reliability', 0) * 100
+    dph = offer.get('dph', 0)
+    
+    return (f"GPU: {gpu_name} (x{num_gpus})\n"
+            f"CUDA: {cuda_max_good}\n"
+            f"Storage: {disk_space:.1f}GB\n"
+            f"CPU Cores: {cpu_cores}\n"
+            f"RAM: {cpu_ram:.1f}GB\n"
+            f"Reliability: {reliability:.1f}%\n"
+            f"Price: ${dph:.3f}/hour")
+
+def display_offers_tui(offers):
+    """Display available offers in a TUI and return selected offer."""
+    try:
+        import curses
+        from curses import wrapper
+    except ImportError:
+        print("Error: curses library not found. Please install 'windows-curses' if you're on Windows.")
+        return offers[0] if offers else None
+
+    def main(stdscr):
+        # Setup colors
+        curses.start_color()
+        curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)
+        curses.init_pair(2, curses.COLOR_CYAN, curses.COLOR_BLACK)
+        
+        # Hide cursor
+        curses.curs_set(0)
+        
+        current_pos = 0
+        offset = 0
+        max_offers = min(len(offers), curses.LINES - 4)
+        
+        while True:
+            stdscr.clear()
+            height, width = stdscr.getmaxyx()
+            
+            # Display header
+            header = "Available vast.ai Instances (Use ↑↓ to navigate, Enter to select, q to quit)"
+            stdscr.addstr(0, 0, header, curses.color_pair(2) | curses.A_BOLD)
+            stdscr.addstr(1, 0, "=" * min(len(header), width - 1))
+            
+            # Display offers
+            for idx in range(max_offers):
+                if idx + offset >= len(offers):
+                    break
+                    
+                offer = offers[idx + offset]
+                is_selected = idx + offset == current_pos
+                
+                # Format instance details
+                details = format_instance_details(offer)
+                lines = details.split('\n')
+                
+                # Calculate display position
+                y_pos = idx * (len(lines) + 1) + 3
+                
+                # Highlight if selected
+                attr = curses.color_pair(1) | curses.A_BOLD if is_selected else curses.A_NORMAL
+                
+                # Display each line of the instance details
+                for line_idx, line in enumerate(lines):
+                    if y_pos + line_idx < height:
+                        stdscr.addstr(y_pos + line_idx, 2, line, attr)
+                
+                # Add separator
+                if y_pos + len(lines) < height:
+                    stdscr.addstr(y_pos + len(lines), 2, "-" * (width - 4))
+            
+            stdscr.refresh()
+            
+            # Handle input
+            key = stdscr.getch()
+            if key == ord('q'):
+                return None
+            elif key == curses.KEY_UP and current_pos > 0:
+                current_pos -= 1
+                if current_pos < offset:
+                    offset = current_pos
+            elif key == curses.KEY_DOWN and current_pos < len(offers) - 1:
+                current_pos += 1
+                if current_pos >= offset + max_offers:
+                    offset = current_pos - max_offers + 1
+            elif key == ord('\n'):  # Enter key
+                return offers[current_pos]
+
+    selected_offer = wrapper(main)
+    return selected_offer
 @parser.command(
     argument("src_directory", help="Source directory containing Dockerfile or docker-compose.yml", type=str),
     argument("--image", help="Base docker image to use (default: pytorch/pytorch:latest)", type=str, default="pytorch/pytorch:latest"),
@@ -1528,14 +1611,26 @@ def magic_deploy(args):
         print("Error: No matching instances found")
         return 1
 
+    print(f"\nFound {len(offers)} matching instances.")
+    print("Launching instance selection interface...")
+    
+    selected_offer = display_offers_tui(offers)
+    if not selected_offer:
+        print("Instance selection cancelled.")
+        return 1
+    
+    print("\nSelected instance:")
+    print(format_instance_details(selected_offer))
+    print("\nProceeding with deployment...")
+    
     # Create instance with retry logic
     env = parse_env(combined_env)
-    instance_id, ssh_host, ssh_port, instance = create_instance_with_retry(args, offers, env)
+    instance_id, ssh_host, ssh_port, instance = create_instance_with_retry(args, selected_offer, env)
     
     if not instance_id:
         print("Failed to create a working instance")
         return 1
-        
+
     print(f"Instance ready at {ssh_host}:{ssh_port}")
     print("Preparing to transfer files...")
     
