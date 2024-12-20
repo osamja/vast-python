@@ -1083,16 +1083,16 @@ def create_instance_with_retry(args, offers, env, max_retries=3):
         print(f"Instance {instance_id} failed to start properly, trying another instance...")
         
         # Destroy failed instance before trying next one
-        url = apiurl(args, f"/instances/{instance_id}/destroy")
+        url = apiurl(args, f"/instances/{instance_id}")
         try:
-            r = http_delete(args, url)
+            r = http_del(args, url, headers={})
             r.raise_for_status()
             print(f"Cleaned up failed instance {instance_id}")
         except Exception as e:
             print(f"Warning: Failed to clean up instance {instance_id}: {str(e)}")
     
     print(f"Failed to create instance after {max_retries} attempts")
-    return None, None, None
+    return None, None, None, None
 
 def install_docker_compose(ssh_host, ssh_port):
     """Install Docker Compose on the remote instance if not already installed.
