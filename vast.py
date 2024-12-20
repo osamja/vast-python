@@ -1333,6 +1333,18 @@ def magic_build(args):
     print("\nDeployment complete!")
     print(f"Instance ID: {instance_id}")
     print(f"SSH access: ssh -p {ssh_port} root@{ssh_host}")
+    
+    # Print all exposed port URLs
+    print("\nExposed ports:")
+    for port_key, mappings in instance.get("ports", {}).items():
+        container_port = port_key.split('/')[0]
+        protocol = "udp://" if "udp" in port_key.lower() else "http://"
+        
+        for mapping in mappings:
+            if mapping.get("HostIp") == "0.0.0.0":
+                host_port = mapping.get("HostPort")
+                url = f"{protocol}{ssh_host}:{host_port}"
+                print(f"  Container port {container_port} -> {url}")
 
     return 0
 
