@@ -1414,7 +1414,7 @@ def format_instance_details(offer):
     cpu_cores = offer.get('cpu_cores', 0)
     cpu_ram = offer.get('cpu_ram', 0)
     reliability = offer.get('reliability', 0) * 100
-    dph = offer.get('dph', 0)
+    dph = offer.get('dph_total', 0)
     
     return (f"GPU: {gpu_name} (x{num_gpus})\n"
             f"CUDA: {cuda_max_good}\n"
@@ -1438,69 +1438,160 @@ def display_offers_tui(offers):
         curses.start_color()
         curses.init_pair(1, curses.COLOR_GREEN, curses.COLOR_BLACK)
         curses.init_pair(2, curses.COLOR_CYAN, curses.COLOR_BLACK)
+        curses.init_pair(3, curses.COLOR_YELLOW, curses.COLOR_BLACK)  # For scroll indicators
         
         # Hide cursor
         curses.curs_set(0)
         
+        # Enable keypad for special keys
+        stdscr.keypad(True)
+        
+        # Disable input echoing and line buffering
+        curses.noecho()
+        curses.raw()
+        
         current_pos = 0
         offset = 0
-        max_offers = min(len(offers), curses.LINES - 4)
-        
+        scroll_pos = 0
+
+        def get_offer_height(offer):
+            """Calculate height needed to display an offer"""
+            details = format_instance_details(offer)
+            return len(details.split('\n')) + 1  # +1 for separator
+
+        def calculate_visible_offers(height):
+            """Calculate how many offers can be displayed"""
+            available_height = height - 4  # Account for header and borders
+            visible_offers = []
+            total_height = 0
+            
+            for offer in offers[scroll_pos:]:
+                offer_height = get_offer_height(offer)
+                if total_height + offer_height > available_height:
+                    break
+                visible_offers.append(offer)
+                total_height += offer_height
+                
+            return visible_offers, total_height
+
         while True:
             stdscr.clear()
             height, width = stdscr.getmaxyx()
             
-            # Display header
-            header = "Available vast.ai Instances (Use ↑↓ to navigate, Enter to select, q to quit)"
-            stdscr.addstr(0, 0, header, curses.color_pair(2) | curses.A_BOLD)
-            stdscr.addstr(1, 0, "=" * min(len(header), width - 1))
+            # Calculate visible offers
+            visible_offers, total_content_height = calculate_visible_offers(height)
+            max_scroll = len(offers) - len(visible_offers)
+            
+            # Display header with VIM bindings and scroll info
+            header = "Available vast.ai Instances (j/k or ↑↓ to navigate, Enter/Space to select, q to quit)"
+            scroll_info = f" [{scroll_pos + 1}-{min(scroll_pos + len(visible_offers), len(offers))}/{len(offers)}]"
+            header_with_scroll = header + scroll_info
+            stdscr.addstr(0, 0, header_with_scroll[:width-1], curses.color_pair(2) | curses.A_BOLD)
+            stdscr.addstr(1, 0, "=" * min(len(header_with_scroll), width - 1))
+            
+            # Display scroll indicators if needed
+            if scroll_pos > 0:
+                stdscr.addstr(2, width-2, "↑", curses.color_pair(3) | curses.A_BOLD)
+            if scroll_pos + len(visible_offers) < len(offers):
+                stdscr.addstr(height-1, width-2, "↓", curses.color_pair(3) | curses.A_BOLD)
             
             # Display offers
-            for idx in range(max_offers):
-                if idx + offset >= len(offers):
-                    break
-                    
-                offer = offers[idx + offset]
-                is_selected = idx + offset == current_pos
+            current_y = 3
+            for idx, offer in enumerate(visible_offers):
+                is_selected = scroll_pos + idx == current_pos
                 
                 # Format instance details
                 details = format_instance_details(offer)
                 lines = details.split('\n')
                 
-                # Calculate display position
-                y_pos = idx * (len(lines) + 1) + 3
-                
                 # Highlight if selected
                 attr = curses.color_pair(1) | curses.A_BOLD if is_selected else curses.A_NORMAL
                 
                 # Display each line of the instance details
-                for line_idx, line in enumerate(lines):
-                    if y_pos + line_idx < height:
-                        stdscr.addstr(y_pos + line_idx, 2, line, attr)
+                for line in lines:
+                    if current_y < height - 1:  # Leave room for bottom scroll indicator
+                        stdscr.addstr(current_y, 2, line[:width-4], attr)
+                        current_y += 1
                 
                 # Add separator
-                if y_pos + len(lines) < height:
-                    stdscr.addstr(y_pos + len(lines), 2, "-" * (width - 4))
+                if current_y < height - 1:
+                    stdscr.addstr(current_y, 2, "-" * (width - 4))
+                    current_y += 1
             
             stdscr.refresh()
             
             # Handle input
-            key = stdscr.getch()
-            if key == ord('q'):
+            try:
+                key = stdscr.getch()
+            except KeyboardInterrupt:
                 return None
-            elif key == curses.KEY_UP and current_pos > 0:
+                
+            # Calculate current visible range
+            visible_range = range(scroll_pos, scroll_pos + len(visible_offers))
+                
+            # VIM-style movement
+            if key in (ord('k'), curses.KEY_UP) and current_pos > 0:
                 current_pos -= 1
-                if current_pos < offset:
-                    offset = current_pos
-            elif key == curses.KEY_DOWN and current_pos < len(offers) - 1:
+                # Scroll up if selection moves above visible area
+                if current_pos < scroll_pos:
+                    scroll_pos = current_pos
+            elif key in (ord('j'), curses.KEY_DOWN) and current_pos < len(offers) - 1:
                 current_pos += 1
-                if current_pos >= offset + max_offers:
-                    offset = current_pos - max_offers + 1
-            elif key == ord('\n'):  # Enter key
+                # Scroll down if selection moves below visible area
+                if current_pos >= scroll_pos + len(visible_offers):
+                    scroll_pos = max(0, current_pos - len(visible_offers) + 1)
+            # VIM-style movement - additional bindings
+            elif key == ord('g'):  # Go to top
+                current_pos = 0
+                scroll_pos = 0
+            elif key == ord('G'):  # Go to bottom
+                current_pos = len(offers) - 1
+                scroll_pos = max(0, len(offers) - len(visible_offers))
+            elif key == ord('d'):  # Half page down
+                visible_count = len(visible_offers)
+                scroll_amount = visible_count // 2
+                current_pos = min(current_pos + scroll_amount, len(offers) - 1)
+                if current_pos >= scroll_pos + visible_count:
+                    scroll_pos = min(scroll_pos + scroll_amount, max_scroll)
+            elif key == ord('u'):  # Half page up
+                visible_count = len(visible_offers)
+                scroll_amount = visible_count // 2
+                current_pos = max(0, current_pos - scroll_amount)
+                scroll_pos = max(0, scroll_pos - scroll_amount)
+            elif key == ord('f'):  # Full page forward
+                visible_count = len(visible_offers)
+                current_pos = min(current_pos + visible_count, len(offers) - 1)
+                scroll_pos = min(scroll_pos + visible_count, max_scroll)
+            elif key == ord('b'):  # Full page backward
+                visible_count = len(visible_offers)
+                current_pos = max(0, current_pos - visible_count)
+                scroll_pos = max(0, scroll_pos - visible_count)
+            # Selection and exit
+            elif key in (ord('\n'), ord(' ')):  # Enter or Space
                 return offers[current_pos]
-
-    selected_offer = wrapper(main)
+            elif key in (ord('q'), ord('Q'), 27):  # q, Q, or ESC
+                return None
+                
+            # Handle resize events
+            if key == curses.KEY_RESIZE:
+                height, width = stdscr.getmaxyx()
+                # Recalculate visible offers and adjust scroll position if needed
+                visible_offers, _ = calculate_visible_offers(height)
+                if current_pos >= scroll_pos + len(visible_offers):
+                    scroll_pos = max(0, current_pos - len(visible_offers) + 1)
+    
+    try:
+        selected_offer = wrapper(main)
+    except KeyboardInterrupt:
+        return None
+    finally:
+        # Reset terminal
+        curses.nocbreak()
+        curses.echo()
+        curses.endwin()
+    
     return selected_offer
+
 @parser.command(
     argument("src_directory", help="Source directory containing Dockerfile or docker-compose.yml", type=str),
     argument("--image", help="Base docker image to use (default: pytorch/pytorch:latest)", type=str, default="pytorch/pytorch:latest"),
