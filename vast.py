@@ -1371,6 +1371,53 @@ def transfer_files_rsync(src_directory, ssh_host, ssh_port, dest_path):
         
     return True
 
+def clean_compose_file(compose_path, output_path=None):
+    """
+    Clean docker-compose.yml file by removing unsupported features.
+    
+    Args:
+        compose_path (str): Path to source docker-compose.yml
+        output_path (str, optional): Path to write cleaned file. If None, modifies in place.
+        
+    Returns:
+        str: Path to cleaned compose file
+    """
+    import yaml
+    import copy
+    
+    # Load the compose file
+    with open(compose_path, 'r') as f:
+        compose_data = yaml.safe_load(f)
+    
+    # Make a deep copy to modify
+    cleaned_data = copy.deepcopy(compose_data)
+    
+    # List of unsupported keys to remove
+    unsupported_keys = ['develop', 'watch']
+    
+    # Clean each service
+    for service_name, service_data in compose_data.get('services', {}).items():
+        if not isinstance(service_data, dict):
+            continue
+            
+        # Remove unsupported keys
+        for key in unsupported_keys:
+            if key in service_data:
+                del cleaned_data['services'][service_name][key]
+    
+    # Determine output path
+    final_path = output_path or compose_path
+    if not output_path:
+        # If modifying in place, create backup
+        import shutil
+        backup_path = compose_path + '.backup'
+        shutil.copy2(compose_path, backup_path)
+    
+    # Write cleaned compose file
+    with open(final_path, 'w') as f:
+        yaml.dump(cleaned_data, f, default_flow_style=False)
+    
+    return final_path
 @parser.command(
     argument("src_directory", help="Source directory containing Dockerfile or docker-compose.yml", type=str),
     argument("--image", help="Base docker image to use (default: pytorch/pytorch:latest)", type=str, default="pytorch/pytorch:latest"),
@@ -1435,8 +1482,12 @@ def magic_deploy(args):
 
     # Detect Dockerfile and docker-compose.yml
     dockerfile_path = os.path.join(src_directory, 'Dockerfile')
-    compose_path = os.path.join(src_directory, 'docker-compose.yml')
-
+    compose_path = os.path.join(src_directory, 'compose.yaml')
+    if os.path.exists(compose_path):
+        print("Cleaning docker-compose.yml to remove unsupported features...")
+        cleaned_compose_path = os.path.join(src_directory, 'docker-compose.clean.yml')
+        compose_path = clean_compose_file(compose_path, cleaned_compose_path)
+    
     if not os.path.exists(dockerfile_path) and not os.path.exists(compose_path):
         print("Error: Neither Dockerfile nor docker-compose.yml found in source directory")
         return 1
