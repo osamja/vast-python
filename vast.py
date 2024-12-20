@@ -988,6 +988,16 @@ def run_command(cmd: str) -> tuple[int, str, str]:
     )
     stdout, stderr = process.communicate()
     return process.returncode, stdout, stderr
+# Define SSH options for more resilient connections
+ssh_opts = (
+    "-o StrictHostKeyChecking=no "
+    "-o UserKnownHostsFile=/dev/null "
+    "-o ConnectTimeout=30 "
+    "-o ServerAliveInterval=60 "
+    "-o ServerAliveCountMax=10 "
+    "-o TCPKeepAlive=yes "
+    "-o BatchMode=yes"
+)
 
 def create_instance_with_retry(args, offer, env, max_retries=3):
     """
@@ -1094,7 +1104,7 @@ def install_docker_compose(ssh_host, ssh_port):
         bool: True if successful, False if failed
     """
     # Check if docker compose is installed (either new or old version)
-    check_cmd = f"ssh -p {ssh_port} root@{ssh_host} 'which docker-compose || which docker-compose-v2 || echo not_found'"
+    check_cmd = f"ssh {ssh_opts} -p {ssh_port} root@{ssh_host} 'which docker-compose || which docker-compose-v2 || echo not_found'"
     returncode, stdout, stderr = run_command(check_cmd)
     
     if "not_found" in stdout:
@@ -1128,7 +1138,7 @@ def install_docker_compose(ssh_host, ssh_port):
             
             # Run installation commands
             install_cmd = " && ".join(method_commands)
-            ssh_cmd = f"ssh -p {ssh_port} root@{ssh_host} '{install_cmd}'"
+            ssh_cmd = f"ssh -p {ssh_opts} {ssh_port} root@{ssh_host} '{install_cmd}'"
             returncode, stdout, stderr = run_command(ssh_cmd)
             
             if returncode == 0:
@@ -1300,16 +1310,6 @@ def parse_env_magic(env_str, ports):
     # Join all parts with spaces
     return " ".join(parts)
 
-# Define SSH options for more resilient connections
-ssh_opts = (
-    "-o StrictHostKeyChecking=no "
-    "-o UserKnownHostsFile=/dev/null "
-    "-o ConnectTimeout=30 "
-    "-o ServerAliveInterval=60 "
-    "-o ServerAliveCountMax=10 "
-    "-o TCPKeepAlive=yes "
-    "-o BatchMode=yes"
-)
 
 def transfer_files_rsync(src_directory, ssh_host, ssh_port, dest_path):
     """Transfer files using rsync with progress monitoring."""
@@ -1827,6 +1827,235 @@ def magic_deploy(args):
                 host_port = mapping.get("HostPort")
                 url = f"{protocol}{ssh_host}:{host_port}"
                 print(f"  Container port {container_port} -> {url}")
+
+    return 0
+
+@parser.command(
+    argument("src_directory", help="Source directory containing docker-stack.yml or docker-compose.yml", type=str),
+    argument("--image", help="Base docker image to use (default: pytorch/pytorch:latest)", type=str, default="pytorch/pytorch:latest"),
+    argument("--price", help="Maximum price per GPU in $/hour (default: 0.2)", type=float, default=0.2),
+    argument("--gpus", help="Number of GPUs (default: 1)", type=int, default=1),
+    argument("--worker-count", help="Number of worker nodes (default: 1)", type=int, default=1),
+    argument("--copy-dest", help="Destination path on instance (default: /root/build)", type=str, default="/root/build"),
+    argument("--bid-price", help="(OPTIONAL) Create an interruptible instance with per machine bid price in $/hour", type=float),
+    argument("--label", help="Label to set on the manager instance for the stack name", type=str, default="app"),
+    argument("--env", help="Additional environment variables and port mappings, surround with quotes", type=str),
+    argument("--direct", help="Use direct connections for SSH", action="store_true"),
+    usage="vastai deploy_cluster src_directory [OPTIONS]",
+    help="Deploy a two-node (or multi-node) Docker Swarm cluster with a manager and workers on vast.ai instances and run a Docker stack",
+)
+def deploy_cluster(args):
+    # Validate source directory
+    src_directory = os.path.abspath(args.src_directory)
+    if not os.path.isdir(src_directory):
+        print(f"Error: Directory not found: {src_directory}")
+        return 1
+
+    # Detect docker-stack.yml or docker-compose.yml
+    stack_file = os.path.join(src_directory, 'docker-stack.yml')
+    compose_path = os.path.join(src_directory, 'docker-compose.yml')
+    if not os.path.exists(stack_file) and os.path.exists(compose_path):
+        print("Cleaning docker-compose.yml to remove unsupported features...")
+        cleaned_compose_path = os.path.join(src_directory, 'docker-compose.clean.yml')
+        compose_path = clean_compose_file(compose_path, cleaned_compose_path)
+
+    if not os.path.exists(stack_file):
+        print("Error: docker-stack.yml not found in source directory")
+        return 1
+
+    # Parse ports from Dockerfile and stack file
+    dockerfile_path = os.path.join(src_directory, 'Dockerfile')
+    ports = []
+    if os.path.exists(dockerfile_path):
+        ports.extend(parse_docker_ports(dockerfile_path))
+    ports.extend(parse_compose_ports(stack_file))
+    ports = list(set(ports))
+
+    # Include swarm port 2377 so it's mapped externally
+    if 2377 not in ports:
+        ports.append(2377)
+
+    # Parse environment variables from stack/compose file
+    compose_env = parse_compose_env(stack_file) if os.path.exists(stack_file) else ""
+
+    # Combine environment variables from CLI and compose
+    combined_env = parse_env_magic(args.env, ports)
+    if compose_env:
+        combined_env = f"{compose_env} {combined_env}" if combined_env else compose_env
+
+    # Create a query to find suitable instances on vast.ai
+    query = {
+        "verified": {"eq": True},
+        "external": {"eq": False},
+        "rentable": {"eq": True},
+        "vms_enabled": {"eq": True},
+        "num_gpus": {"eq": args.gpus},
+        "reliability": {"gt": 0.98},
+        "direct_port_count": {"gte": len(ports) if ports else 2},
+        "dph": {"lte": args.price}
+    }
+
+    print(f"Searching for instances matching requirements...")
+    url = apiurl(args, "/bundles/")
+    r = http_post(args, url, headers=headers, json=query)
+    r.raise_for_status()
+    offers = r.json()["offers"]
+
+    if not offers:
+        print("Error: No matching instances found")
+        return 1
+
+    print(f"\nFound {len(offers)} matching instances.")
+
+    # Select manager node
+    print("\n*** Select Manager Node ***")
+    manager_offer = display_offers_tui(offers)
+    if not manager_offer:
+        print("Manager instance selection cancelled.")
+        return 1
+
+    print("\nSelected manager instance:")
+    print(format_instance_details(manager_offer))
+
+    # Select worker nodes
+    workers_offers = []
+    for i in range(args.worker_count):
+        print(f"\n*** Select Worker Node {i+1}/{args.worker_count} ***")
+        worker_offer = display_offers_tui(offers)
+        if not worker_offer:
+            print("Worker instance selection cancelled.")
+            return 1
+        workers_offers.append(worker_offer)
+
+        print(f"\nSelected worker instance {i+1}:")
+        print(format_instance_details(worker_offer))
+
+    # Parse env dictionary
+    env = parse_env(combined_env)
+
+    # Create manager instance
+    print("\nCreating manager instance...")
+    manager_id, manager_host, manager_port, manager_instance = create_instance_with_retry(args, manager_offer, env)
+    if not manager_id:
+        print("Failed to create manager instance.")
+        return 1
+    print(f"Manager instance ready at {manager_host}:{manager_port}")
+
+    # Create worker instances
+    worker_instances = []
+    for i, w_offer in enumerate(workers_offers, start=1):
+        print(f"\nCreating worker instance {i}...")
+        w_id, w_host, w_port, w_instance = create_instance_with_retry(args, w_offer, env)
+        if not w_id:
+            print(f"Failed to create worker instance {i}.")
+            return 1
+        print(f"Worker {i} instance ready at {w_host}:{w_port}")
+        worker_instances.append((w_id, w_host, w_port, w_instance))
+
+    # Transfer files (including docker-stack.yml) to manager node
+    print("\nTransferring files to manager node...")
+    if not transfer_files_rsync(src_directory, manager_host, manager_port, args.copy_dest):
+        print("Failed to transfer files to manager node")
+        return 1
+
+    # Ensure Docker Compose is installed on manager node
+    print("Ensuring Docker Compose is installed on manager node...")
+    if not install_docker_compose(manager_host, manager_port):
+        print("Failed to ensure Docker Compose on manager node.")
+        return 1
+
+    # Retrieve manager instance details to find mapped 2377 port
+    print("Retrieving manager instance details to find mapped 2377 port...")
+    url = apiurl(args, "/instances", {"owner": "me"})
+    r = http_get(args, url)
+    r.raise_for_status()
+    all_instances = r.json().get("instances", [])
+    manager_data = next((i for i in all_instances if i["id"] == manager_id), None)
+    if not manager_data:
+        print("Could not find manager instance details.")
+        return 1
+
+    manager_external_ip = manager_data.get("public_ipaddr")
+    swarm_host_port = None
+    for port_mapping in manager_data.get("ports", {}).get("2377/tcp", []):
+        if port_mapping.get("HostIp") == "0.0.0.0":
+            swarm_host_port = port_mapping.get("HostPort")
+            break
+
+    if not swarm_host_port:
+        print("No external port mapped for 2377 on the manager instance.")
+        return 1
+
+    # Initialize Swarm on manager using external IP:PORT
+    print("\nInitializing Docker Swarm on manager node...")
+    init_cmd = f"docker swarm init --advertise-addr {manager_external_ip}:{swarm_host_port}"
+    ssh_cmd = f"ssh {ssh_opts} -p {manager_port} root@{manager_host} '{init_cmd}'"
+    returncode, stdout, stderr = run_command(ssh_cmd)
+    if returncode != 0:
+        print("Failed to init swarm:", stderr)
+        return 1
+
+    # Extract join command for workers
+    join_cmd = None
+    for line in stdout.split('\n'):
+        if 'docker swarm join' in line:
+            join_cmd = line.strip()
+            break
+    if not join_cmd:
+        print("Could not find join command in swarm init output")
+        return 1
+
+    max_retries = 3
+    retry_delay = 10  # seconds
+
+    for i, (w_id, w_host, w_port, w_instance) in enumerate(worker_instances, start=1):
+        print(f"\nJoining worker {i} node to the swarm...")
+        success = False
+        for attempt in range(max_retries):
+            ssh_cmd = f"ssh {ssh_opts} -p {w_port} root@{w_host} '{join_cmd}'"
+            returncode, w_stdout, w_stderr = run_command(ssh_cmd)
+            
+            if returncode == 0:
+                print(f"Worker {i} joined the swarm successfully.")
+                success = True
+                break
+            else:
+                print(f"Attempt {attempt+1}/{max_retries} failed to join worker {i}: {w_stderr}")
+                if attempt < max_retries - 1:
+                    print(f"Retrying in {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+        
+        if not success:
+            print(f"Failed to join worker {i} after {max_retries} attempts.")
+            return 1
+
+    # Deploy the stack from manager
+    print("\nDeploying the stack on the manager node...")
+    deploy_cmd = f"cd {args.copy_dest} && docker stack deploy --compose-file docker-stack.yml {args.label}"
+    ssh_cmd = f"ssh {ssh_opts} -p {manager_port} root@{manager_host} '{deploy_cmd}'"
+    returncode, stdout, stderr = run_command(ssh_cmd)
+    if returncode != 0:
+        print("Failed to deploy stack:", stderr)
+        return 1
+
+    print("\nStack deployed successfully. Your Swarm cluster is running the stack!")
+    print(f"Manager Node: ssh {ssh_opts} -p {manager_port} root@{manager_host}")
+    for i, (w_id, w_host, w_port, w_instance) in enumerate(worker_instances, start=1):
+        print(f"Worker {i} Node:  ssh {ssh_opts} -p {w_port} root@{w_host}")
+
+    # Print exposed ports from manager instance
+    print("\nExposed ports on manager node:")
+    for port_key, mappings in manager_data.get("ports", {}).items():
+        container_port = port_key.split('/')[0]
+        protocol = "http://" if "tcp" in port_key.lower() else "udp://"
+        for mapping in mappings:
+            if mapping.get("HostIp") == "0.0.0.0":
+                host_port = mapping.get("HostPort")
+                url = f"{protocol}{manager_external_ip}:{host_port}"
+                print(f"  Container port {container_port} -> {url}")
+
+    print("\nRemember: In Swarm mode, published ports are handled by the routing mesh.")
+    print("Check the docker-stack.yml for 'ports:' entries. Access via the manager's public IP and the published port.")
 
     return 0
 
