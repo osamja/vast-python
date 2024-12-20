@@ -1299,21 +1299,21 @@ def parse_env_magic(env_str, ports):
     # Join all parts with spaces
     return " ".join(parts)
 
+# Define SSH options for more resilient connections
+ssh_opts = (
+    "-o StrictHostKeyChecking=no "
+    "-o UserKnownHostsFile=/dev/null "
+    "-o ConnectTimeout=30 "
+    "-o ServerAliveInterval=60 "
+    "-o ServerAliveCountMax=10 "
+    "-o TCPKeepAlive=yes "
+    "-o BatchMode=yes"
+)
+
 def transfer_files_rsync(src_directory, ssh_host, ssh_port, dest_path):
     """Transfer files using rsync with progress monitoring."""
     # Ensure source directory ends with / to copy contents
     src_directory = os.path.join(src_directory, '')
-    
-    # Define SSH options for more resilient connections
-    ssh_opts = (
-        "-o StrictHostKeyChecking=no "
-        "-o UserKnownHostsFile=/dev/null "
-        "-o ConnectTimeout=30 "
-        "-o ServerAliveInterval=60 "
-        "-o ServerAliveCountMax=10 "
-        "-o TCPKeepAlive=yes "
-        "-o BatchMode=yes"
-    )
     
     # Create the destination directory with retries
     max_retries = 3
@@ -1752,7 +1752,7 @@ def magic_deploy(args):
     project_name = os.path.basename(src_directory)
     if os.path.exists(compose_path):
         # First, determine which docker compose command works
-        test_cmd = f"ssh -o StrictHostKeyChecking=no -p {ssh_port} root@{ssh_host} 'docker compose version >/dev/null 2>&1 || docker-compose --version >/dev/null 2>&1'"
+        test_cmd = f"ssh {ssh_opts} -p {ssh_port} root@{ssh_host} 'docker compose version >/dev/null 2>&1 || docker-compose --version >/dev/null 2>&1'"
         returncode, _, _ = run_command(test_cmd)
         
         # Choose the appropriate command based on what's available
@@ -1769,7 +1769,7 @@ def magic_deploy(args):
         port_flags = " ".join([f"-p {port}:{port}" for port in ports]) if ports else ""
         cmd = f"cd {args.copy_dest} && docker build -t app . && docker run -d {port_flags} app"
         print(f"Running Docker build/run: {cmd}")
-    ssh_cmd = f"ssh -o StrictHostKeyChecking=no -p {ssh_port} root@{ssh_host} '{cmd}'"
+    ssh_cmd = f"ssh {ssh_opts} -p {ssh_port} root@{ssh_host} '{cmd}'"
     returncode, stdout, stderr = run_command(ssh_cmd)
     
     if stderr:
@@ -1785,7 +1785,7 @@ def magic_deploy(args):
 
     print("\nDeployment complete!")
     print(f"Instance ID: {instance_id}")
-    print(f"SSH access: ssh -p {ssh_port} root@{ssh_host}")
+    print(f"SSH access: ssh {ssh_opts} -p {ssh_port} root@{ssh_host}")
 
     # Print all exposed port URLs
     print("\nExposed ports:")
