@@ -1300,40 +1300,44 @@ def parse_env_magic(env_str, ports):
     return " ".join(parts)
 
 def transfer_files_rsync(src_directory, ssh_host, ssh_port, dest_path):
-    """Transfer files using rsync with progress monitoring.
-    
-    Args:
-        src_directory (str): Source directory path
-        ssh_host (str): Remote host address
-        ssh_port (int): SSH port number
-        dest_path (str): Destination path on remote host
-        
-    Returns:
-        bool: True if successful, False if failed
-    """
+    """Transfer files using rsync with progress monitoring."""
     # Ensure source directory ends with / to copy contents
     src_directory = os.path.join(src_directory, '')
     
-    # First, create the parent directory structure
-    parent_dir = os.path.dirname(dest_path)
-    mkdir_cmd = f"ssh -p {ssh_port} -o StrictHostKeyChecking=no root@{ssh_host} 'mkdir -p {parent_dir}'"
-    returncode, stdout, stderr = run_command(mkdir_cmd)
+    # Define SSH options for more resilient connections
+    ssh_opts = (
+        "-o StrictHostKeyChecking=no "
+        "-o UserKnownHostsFile=/dev/null "
+        "-o ConnectTimeout=30 "
+        "-o ServerAliveInterval=60 "
+        "-o ServerAliveCountMax=10 "
+        "-o TCPKeepAlive=yes "
+        "-o BatchMode=yes"
+    )
     
-    if returncode != 0:
-        print(f"Error creating directory structure: {stderr}")
+    # Create the destination directory with retries
+    max_retries = 3
+    retry_delay = 5  # seconds
+    
+    for attempt in range(max_retries):
+        mkdir_cmd = f"ssh -p {ssh_port} {ssh_opts} root@{ssh_host} 'mkdir -p {dest_path}'"
+        returncode, stdout, stderr = run_command(mkdir_cmd)
+        
+        if returncode == 0:
+            break
+            
+        print(f"Attempt {attempt + 1}/{max_retries}: Directory creation failed: {stderr}")
+        if attempt < max_retries - 1:
+            print(f"Retrying in {retry_delay} seconds...")
+            time.sleep(retry_delay)
+    else:
+        print("Failed to create destination directory after all retries")
         return False
     
-    # Now create the actual destination directory
-    mkdir_cmd = f"ssh -p {ssh_port} -o StrictHostKeyChecking=no root@{ssh_host} 'mkdir -p {dest_path}'"
-    returncode, stdout, stderr = run_command(mkdir_cmd)
-    
-    if returncode != 0:
-        print(f"Error creating destination directory: {stderr}")
-        return False
-    
-    # Construct rsync command with progress monitoring
+    # Construct rsync command with progress monitoring and same SSH options
     rsync_cmd = (
-        f"rsync -avz --compress-level=9 --progress -e 'ssh -p {ssh_port} -o StrictHostKeyChecking=no' "
+        f"rsync -avz --compress-level=9 --progress "
+        f"-e 'ssh -p {ssh_port} {ssh_opts}' "
         f"--exclude '.git' --exclude '*.pyc' --exclude '__pycache__' "
         f"{src_directory} root@{ssh_host}:{dest_path}"
     )
@@ -1342,21 +1346,26 @@ def transfer_files_rsync(src_directory, ssh_host, ssh_port, dest_path):
     print(f"Source: {src_directory}")
     print(f"Destination: root@{ssh_host}:{dest_path}")
     
-    returncode, stdout, stderr = run_command(rsync_cmd)
-    
-    if stdout:
-        # Print rsync progress in real-time
-        print(stdout)
-    
-    if stderr:
+    # Add retry logic for rsync as well
+    for attempt in range(max_retries):
+        returncode, stdout, stderr = run_command(rsync_cmd)
+        
+        if stdout:
+            print(stdout)
+        
+        if returncode == 0:
+            return True
+            
+        print(f"Attempt {attempt + 1}/{max_retries}: Transfer failed")
         print("Errors during transfer:")
         print(stderr)
-    
-    if returncode != 0:
-        print(f"Error during file transfer (return code: {returncode})")
-        return False
         
-    return True
+        if attempt < max_retries - 1:
+            print(f"Retrying in {retry_delay} seconds...")
+            time.sleep(retry_delay)
+    
+    print("Failed to transfer files after all retries")
+    return False
 
 def clean_compose_file(compose_path, output_path=None):
     """
@@ -1725,16 +1734,10 @@ def magic_deploy(args):
     print(f"Instance ready at {ssh_host}:{ssh_port}")
     print("Preparing to transfer files...")
     
-    time.sleep(5)
-    # Create the destination directory if it doesn't exist
-    mkdir_cmd = f"ssh -o StrictHostKeyChecking=no -p {ssh_port} root@{ssh_host} 'mkdir -p /'"
-    returncode, stdout, stderr = run_command(mkdir_cmd)
-    if returncode != 0:
-        print(f"Error creating destination directory: {stderr}")
-        return 1
-
-    # Transfer files using rsync
-    if not transfer_files_rsync(src_directory, ssh_host, ssh_port, src_directory):
+    time.sleep(10)
+    
+    # Transfer files using rsync with the correct destination path
+    if not transfer_files_rsync(src_directory, ssh_host, ssh_port, args.copy_dest):
         print("Failed to transfer files")
         return 1
 
