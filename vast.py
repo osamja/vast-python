@@ -1314,10 +1314,13 @@ def magic_build(args):
     if os.path.exists(compose_path):
         cmd = f"cd {args.copy_dest} && docker-compose up -d"
     else:
-        cmd = f"cd {args.copy_dest} && docker build -t app . && docker run -d app"
+        # If we have detected ports, map them all
+        port_flags = " ".join([f"-p {port}:{port}" for port in ports]) if ports else ""
+        cmd = f"cd {args.copy_dest} && docker build -t app . && docker run -d {port_flags} app"
 
     ssh_cmd = f"ssh -o StrictHostKeyChecking=no -p {ssh_port} root@{ssh_host} '{cmd}'"
     returncode, stdout, stderr = run_command(ssh_cmd)
+
     
     if stderr:
         print("Errors during build/run:")
