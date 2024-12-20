@@ -1075,7 +1075,7 @@ def create_instance_with_retry(args, offers, env, max_retries=3):
                         if port_mapping.get("HostIp") == "0.0.0.0":
                             ssh_port = port_mapping.get("HostPort")
                             if ssh_host and ssh_port:
-                                return instance_id, ssh_host, ssh_port
+                                return instance_id, ssh_host, ssh_port, instance
                                 
             status_checks += 1
             time.sleep(5)
@@ -1530,7 +1530,7 @@ def magic_deploy(args):
 
     # Create instance with retry logic
     env = parse_env(combined_env)
-    instance_id, ssh_host, ssh_port = create_instance_with_retry(args, offers, env)
+    instance_id, ssh_host, ssh_port, instance = create_instance_with_retry(args, offers, env)
     
     if not instance_id:
         print("Failed to create a working instance")
@@ -1576,7 +1576,9 @@ def magic_deploy(args):
             
         print(f"Running Docker Compose: {cmd}")
     else:
-        cmd = f"cd {src_directory} && docker build -t app . && docker run -d app"
+        # If we have detected ports, map them all
+        port_flags = " ".join([f"-p {port}:{port}" for port in ports]) if ports else ""
+        cmd = f"cd {args.copy_dest} && docker build -t app . && docker run -d {port_flags} app"
         print(f"Running Docker build/run: {cmd}")
     ssh_cmd = f"ssh -o StrictHostKeyChecking=no -p {ssh_port} root@{ssh_host} '{cmd}'"
     returncode, stdout, stderr = run_command(ssh_cmd)
@@ -1595,6 +1597,18 @@ def magic_deploy(args):
     print("\nDeployment complete!")
     print(f"Instance ID: {instance_id}")
     print(f"SSH access: ssh -p {ssh_port} root@{ssh_host}")
+
+    # Print all exposed port URLs
+    print("\nExposed ports:")
+    for port_key, mappings in instance.get("ports", {}).items():
+        container_port = port_key.split('/')[0]
+        protocol = "udp://" if "udp" in port_key.lower() else "http://"
+        
+        for mapping in mappings:
+            if mapping.get("HostIp") == "0.0.0.0":
+                host_port = mapping.get("HostPort")
+                url = f"{protocol}{ssh_host}:{host_port}"
+                print(f"  Container port {container_port} -> {url}")
 
     return 0
 
