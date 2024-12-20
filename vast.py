@@ -987,6 +987,113 @@ def run_command(cmd: str) -> tuple[int, str, str]:
     stdout, stderr = process.communicate()
     return process.returncode, stdout, stderr
 
+def create_instance_with_retry(args, offers, env, max_retries=3):
+    """
+    Attempt to create an instance with retry logic if VM creation fails.
+    
+    Args:
+        args: Command line arguments
+        offers: List of available instance offers
+        env: Environment variables and port mappings
+        max_retries: Maximum number of retry attempts
+        
+    Returns:
+        tuple: (instance_id, ssh_host, ssh_port) if successful, (None, None, None) if all attempts fail
+    """
+    tried_instances = set()
+    
+    for attempt in range(max_retries):
+        # Filter out previously tried instances
+        available_offers = [offer for offer in offers if offer["id"] not in tried_instances]
+        
+        if not available_offers:
+            print("No more available instances to try")
+            return None, None, None
+            
+        # Select random instance from remaining offers
+        import random
+        instance = random.choice(available_offers)
+        instance_id = instance["id"]
+        tried_instances.add(instance_id)
+        
+        print(f"Attempt {attempt + 1}/{max_retries}: Creating instance {instance_id}...")
+        
+        # Create instance
+        create_args = {
+            "client_id": "me",
+            "image": "docker.io/vastai/kvm:ubuntu_terminal",
+            "env": env,
+            "image_login": None,
+            "python_utf8": False,
+            "lang_utf8": False,
+            "use_jupyter_lab": False,
+            "jupyter_dir": None,
+            "jupyter_token": None,
+            "create_from": None,
+            "force": False,
+            "bid_price": args.bid_price,
+            "label": args.label,
+            "onstart": None,
+            "runtype": "ssh_direc ssh_proxy" if args.direct else "ssh",
+            "template_hash_id": None
+        }
+
+        url = apiurl(args, f"/asks/{instance_id}/")
+        r = http_put(args, url, headers=headers, json=create_args)
+        r.raise_for_status()
+        
+        new_instance = r.json()
+        if not new_instance.get("success"):
+            print(f"Error creating instance: {new_instance.get('msg', 'Unknown error')}")
+            continue
+            
+        instance_id = new_instance["new_contract"]
+        print(f"Instance {instance_id} created successfully")
+        
+        # Wait for instance to be ready and check status
+        print("Waiting for instance to be ready...")
+        max_status_checks = 12  # Check for up to 1 minute (5 seconds * 12)
+        status_checks = 0
+        
+        while status_checks < max_status_checks:
+            url = apiurl(args, "/instances", {"owner": "me"})
+            r = http_get(args, url)
+            r.raise_for_status()
+            instances = r.json()["instances"]
+            instance = next((i for i in instances if i["id"] == instance_id), None)
+            
+            if instance:
+                # Check for VM creation failure
+                if instance.get("status_msg") and "VM creation failed" in instance.get("status_msg"):
+                    print(f"VM creation failed: {instance.get('status_msg')}")
+                    break
+                    
+                # Check if instance is running and has connection details
+                if instance.get("actual_status") == "running":
+                    ssh_host = instance.get("public_ipaddr")
+                    for port_mapping in instance.get("ports", {}).get("22/tcp", []):
+                        if port_mapping.get("HostIp") == "0.0.0.0":
+                            ssh_port = port_mapping.get("HostPort")
+                            if ssh_host and ssh_port:
+                                return instance_id, ssh_host, ssh_port
+                                
+            status_checks += 1
+            time.sleep(5)
+            
+        print(f"Instance {instance_id} failed to start properly, trying another instance...")
+        
+        # Destroy failed instance before trying next one
+        url = apiurl(args, f"/instances/{instance_id}/destroy")
+        try:
+            r = http_delete(args, url)
+            r.raise_for_status()
+            print(f"Cleaned up failed instance {instance_id}")
+        except Exception as e:
+            print(f"Warning: Failed to clean up instance {instance_id}: {str(e)}")
+    
+    print(f"Failed to create instance after {max_retries} attempts")
+    return None, None, None
+
 def install_docker_compose(ssh_host, ssh_port):
     """Install Docker Compose on the remote instance if not already installed.
     
@@ -997,42 +1104,61 @@ def install_docker_compose(ssh_host, ssh_port):
     Returns:
         bool: True if successful, False if failed
     """
-    # Check if docker-compose is installed
-    check_cmd = f"ssh -p {ssh_port} root@{ssh_host} 'which docker-compose || echo not_found'"
+    # Check if docker compose is installed (either new or old version)
+    check_cmd = f"ssh -p {ssh_port} root@{ssh_host} 'which docker-compose || which docker-compose-v2 || echo not_found'"
     returncode, stdout, stderr = run_command(check_cmd)
     
     if "not_found" in stdout:
         print("Installing Docker Compose...")
         
-        # Commands to install Docker Compose
-        install_commands = [
-            # Install Docker Compose using apt
-            'apt-get update',
-            'apt-get install -y docker-compose-plugin',
-            # Create symlink for compatibility with older docker-compose command
-            'ln -sf /usr/libexec/docker/cli-plugins/docker-compose /usr/local/bin/docker-compose',
-            # Make it executable
-            'chmod +x /usr/local/bin/docker-compose'
+        # Try multiple installation methods
+        install_methods = [
+            # Method 1: Use apt to install docker-compose-plugin or docker-compose
+            [
+                'apt-get update',
+                'apt-get install -y docker-compose || apt-get install -y docker-compose-plugin'
+            ],
+            
+            # Method 2: Install using curl (official method)
+            [
+                'curl -SL https://github.com/docker/compose/releases/download/v2.24.5/docker-compose-linux-x86_64 -o /usr/local/bin/docker-compose',
+                'chmod +x /usr/local/bin/docker-compose',
+                'ln -sf /usr/local/bin/docker-compose /usr/bin/docker-compose'
+            ],
+            
+            # Method 3: Install docker compose plugin directly
+            [
+                'mkdir -p /usr/local/lib/docker/cli-plugins',
+                'curl -SL https://github.com/docker/compose/releases/download/v2.24.5/docker-compose-linux-x86_64 -o /usr/local/lib/docker/cli-plugins/docker-compose',
+                'chmod +x /usr/local/lib/docker/cli-plugins/docker-compose'
+            ]
         ]
         
-        # Run installation commands
-        install_cmd = " && ".join(install_commands)
-        ssh_cmd = f"ssh -p {ssh_port} root@{ssh_host} '{install_cmd}'"
-        returncode, stdout, stderr = run_command(ssh_cmd)
+        success = False
+        for method_commands in install_methods:
+            print(f"Trying installation method...")
+            
+            # Run installation commands
+            install_cmd = " && ".join(method_commands)
+            ssh_cmd = f"ssh -p {ssh_port} root@{ssh_host} '{install_cmd}'"
+            returncode, stdout, stderr = run_command(ssh_cmd)
+            
+            if returncode == 0:
+                # Verify installation
+                verify_cmd = f"ssh -p {ssh_port} root@{ssh_host} 'docker compose version || docker-compose --version'"
+                returncode, stdout, stderr = run_command(verify_cmd)
+                
+                if returncode == 0:
+                    print("Docker Compose installed successfully")
+                    success = True
+                    break
+            
+            print("This method failed, trying next method...")
         
-        if returncode != 0:
-            print(f"Error installing Docker Compose: {stderr}")
+        if not success:
+            print("All installation methods failed")
             return False
             
-        # Verify installation
-        verify_cmd = f"ssh -p {ssh_port} root@{ssh_host} 'docker-compose --version'"
-        returncode, stdout, stderr = run_command(verify_cmd)
-        
-        if returncode != 0:
-            print(f"Error verifying Docker Compose installation: {stderr}")
-            return False
-            
-        print("Docker Compose installed successfully")
     else:
         print("Docker Compose is already installed")
     
@@ -1057,6 +1183,110 @@ def format_ports_env(ports):
     # Join all port mappings with spaces
     return " ".join(port_mappings)
 
+def parse_compose_env(compose_path):
+    """
+    Parse environment variables from a docker-compose.yml file.
+    
+    Args:
+        compose_path (str): Path to docker-compose.yml file
+        
+    Returns:
+        str: Environment variables in format suitable for parse_env_magic ("-e KEY=value -e KEY2=value2")
+    """
+    if not os.path.exists(compose_path):
+        return ""
+        
+    import yaml
+    import re
+    from pathlib import Path
+    
+    # Environment variables found
+    env_vars = {}
+    
+    try:
+        with open(compose_path, 'r') as f:
+            compose_data = yaml.safe_load(f)
+            
+        if not compose_data or 'services' not in compose_data:
+            return ""
+            
+        # Helper function to extract ${VAR} style variables
+        def extract_env_vars(value):
+            if isinstance(value, str):
+                # Match ${VAR} or ${VAR-default} or ${VAR?error} patterns
+                matches = re.findall(r'\${([^{}]+)}', value)
+                for match in matches:
+                    # Split on - or ? to separate variable name from default/error
+                    var_name = match.split('-')[0].split('?')[0].strip()
+                    env_vars[var_name] = None
+                    
+        # Process each service
+        for service_name, service_data in compose_data['services'].items():
+            if not isinstance(service_data, dict):
+                continue
+                
+            # Process direct environment variables
+            env_block = service_data.get('environment', {})
+            if isinstance(env_block, list):
+                # Handle ['KEY=value', 'KEY2=value2'] format
+                for item in env_block:
+                    if isinstance(item, str) and '=' in item:
+                        key, value = item.split('=', 1)
+                        env_vars[key.strip()] = value.strip()
+            elif isinstance(env_block, dict):
+                # Handle {KEY: value, KEY2: value2} format
+                env_vars.update(env_block)
+                
+            # Process env_file references
+            env_files = service_data.get('env_file', [])
+            if isinstance(env_files, str):
+                env_files = [env_files]
+                
+            for env_file in env_files:
+                env_file_path = Path(compose_path).parent / env_file
+                if env_file_path.exists():
+                    with open(env_file_path, 'r') as f:
+                        for line in f:
+                            line = line.strip()
+                            if line and not line.startswith('#'):
+                                if '=' in line:
+                                    key, value = line.split('=', 1)
+                                    env_vars[key.strip()] = value.strip()
+                                    
+            # Recursively search for ${VAR} patterns in all string values
+            def process_dict(d):
+                if isinstance(d, dict):
+                    for key, value in d.items():
+                        if isinstance(value, (dict, list)):
+                            process_dict(value)
+                        else:
+                            extract_env_vars(str(value))
+                elif isinstance(d, list):
+                    for item in d:
+                        if isinstance(item, (dict, list)):
+                            process_dict(item)
+                        else:
+                            extract_env_vars(str(item))
+                            
+            process_dict(service_data)
+            
+        # Convert env_vars to format compatible with parse_env_magic
+        env_parts = []
+        for key, value in env_vars.items():
+            if value is not None:
+                # If we have a value from docker-compose or .env
+                env_parts.append(f"-e {key}={value}")
+            else:
+                # For variables without values, check environment
+                env_value = os.environ.get(key)
+                if env_value:
+                    env_parts.append(f"-e {key}={env_value}")
+                    
+        return " ".join(env_parts)
+        
+    except Exception as e:
+        print(f"Error parsing docker-compose.yml: {str(e)}")
+        return ""
 def parse_env_magic(env_str, ports):
     """
     Combine environment variables and port mappings into the correct format.
@@ -1081,6 +1311,65 @@ def parse_env_magic(env_str, ports):
     
     # Join all parts with spaces
     return " ".join(parts)
+
+def transfer_files_rsync(src_directory, ssh_host, ssh_port, dest_path):
+    """Transfer files using rsync with progress monitoring.
+    
+    Args:
+        src_directory (str): Source directory path
+        ssh_host (str): Remote host address
+        ssh_port (int): SSH port number
+        dest_path (str): Destination path on remote host
+        
+    Returns:
+        bool: True if successful, False if failed
+    """
+    # Ensure source directory ends with / to copy contents
+    src_directory = os.path.join(src_directory, '')
+    
+    # First, create the parent directory structure
+    parent_dir = os.path.dirname(dest_path)
+    mkdir_cmd = f"ssh -p {ssh_port} -o StrictHostKeyChecking=no root@{ssh_host} 'mkdir -p {parent_dir}'"
+    returncode, stdout, stderr = run_command(mkdir_cmd)
+    
+    if returncode != 0:
+        print(f"Error creating directory structure: {stderr}")
+        return False
+    
+    # Now create the actual destination directory
+    mkdir_cmd = f"ssh -p {ssh_port} -o StrictHostKeyChecking=no root@{ssh_host} 'mkdir -p {dest_path}'"
+    returncode, stdout, stderr = run_command(mkdir_cmd)
+    
+    if returncode != 0:
+        print(f"Error creating destination directory: {stderr}")
+        return False
+    
+    # Construct rsync command with progress monitoring
+    rsync_cmd = (
+        f"rsync -avz --compress-level=9 --progress -e 'ssh -p {ssh_port} -o StrictHostKeyChecking=no' "
+        f"--exclude '.git' --exclude '*.pyc' --exclude '__pycache__' "
+        f"{src_directory} root@{ssh_host}:{dest_path}"
+    )
+    
+    print(f"Starting file transfer with rsync...")
+    print(f"Source: {src_directory}")
+    print(f"Destination: root@{ssh_host}:{dest_path}")
+    
+    returncode, stdout, stderr = run_command(rsync_cmd)
+    
+    if stdout:
+        # Print rsync progress in real-time
+        print(stdout)
+    
+    if stderr:
+        print("Errors during transfer:")
+        print(stderr)
+    
+    if returncode != 0:
+        print(f"Error during file transfer (return code: {returncode})")
+        return False
+        
+    return True
 
 @parser.command(
     argument("src_directory", help="Source directory containing Dockerfile or docker-compose.yml", type=str),
@@ -1132,7 +1421,7 @@ def parse_env_magic(env_str, ports):
             cuda_vers >= 12.1
     """),
 )
-def magic_build(args):
+def magic_deploy(args):
     """Build and deploy Docker projects on vast.ai instances automatically.
     
     :param argparse.Namespace args: should supply all the command-line options
@@ -1158,6 +1447,13 @@ def magic_build(args):
     ports.extend(parse_compose_ports(compose_path))
     ports = list(set(ports))  # Remove duplicates
 
+    # Get environment variables from compose file if it exists
+    compose_env = parse_compose_env(compose_path) if os.path.exists(compose_path) else ""
+
+    # Combine with command line environment vars and ports
+    combined_env = parse_env_magic(args.env, ports)
+    if compose_env:
+        combined_env = f"{compose_env} {combined_env}" if combined_env else compose_env
     # Create search query
     query = {
         "verified": {"eq": True},
@@ -1176,151 +1472,63 @@ def magic_build(args):
     r = http_post(args, url, headers=headers, json=query)
     r.raise_for_status()
     
-    if not r.json()["offers"]:
+    offers = r.json()["offers"]
+    if not offers:
         print("Error: No matching instances found")
         return 1
 
-    # Select best instance
-    import random
-
-    offers = r.json()["offers"]
-    num_offers = len(offers)
-
-    if num_offers > 0:
-        random_index = random.randint(0, num_offers - 1)
-        instance = offers[random_index]
-        instance_id = instance["id"]
-    else:
-        raise ValueError("No offers available to select from")
+    # Create instance with retry logic
+    env = parse_env(combined_env)
+    instance_id, ssh_host, ssh_port = create_instance_with_retry(args, offers, env)
     
-    # Create instance
-    print(f"Creating instance {instance_id}...")
-
-    print("ports:", ports)
-    env = parse_env(parse_env_magic(args.env, ports))
-    print("env:", env)
-    # env = parse_env(ports) + args.env if args.env else parse_env(parse_env_magic(ports))
-    
-    create_args = {
-        "client_id": "me",
-        "image": "docker.io/vastai/kvm:ubuntu_terminal",  # Using the known working image
-        "env": env,
-        "image_login": None,
-        "python_utf8": False,
-        "lang_utf8": False,
-        "use_jupyter_lab": False,
-        "jupyter_dir": None,
-        "jupyter_token": None,
-        "create_from": None,
-        "force": False,
-        "bid_price": args.bid_price,
-        "label": args.label,
-        "onstart": None,
-        "runtype": "ssh_direc ssh_proxy" if args.direct else "ssh",
-        "template_hash_id": None
-    }
-
-    url = apiurl(args, f"/asks/{instance_id}/")
-    r = http_put(args, url, headers=headers, json=create_args)
-    r.raise_for_status()
-    
-    new_instance = r.json()
-    if not new_instance.get("success"):
-        print("Error creating instance:", new_instance.get("msg", "Unknown error"))
+    if not instance_id:
+        print("Failed to create a working instance")
         return 1
-
-    instance_id = new_instance["new_contract"]
-    print(f"Instance {instance_id} created successfully")
-
-    # Wait for instance to be ready and get connection details
-    print("Waiting for instance to be ready...")
-    ssh_host = None
-    ssh_port = None
-
-    while True:
-        url = apiurl(args, "/instances", {"owner": "me"})
-        r = http_get(args, url)
-        r.raise_for_status()
-        instances = r.json()["instances"]
-        instance = next((i for i in instances if i["id"] == instance_id), None)
-        if instance and instance.get("actual_status") == "running":
-            ssh_host = instance.get("public_ipaddr")
-            for port_mapping in instance.get("ports", {}).get("22/tcp", []):
-                if port_mapping.get("HostIp") == "0.0.0.0":
-                    ssh_port = port_mapping.get("HostPort")
-                    break
-            if ssh_host and ssh_port:
-                break
-        time.sleep(5)
-
+        
     print(f"Instance ready at {ssh_host}:{ssh_port}")
-    print("Attempting to copy files...")
+    print("Preparing to transfer files...")
     
-    # Debug: Print the exact scp command we're going to run
-    scp_cmd = f"scp -o StrictHostKeyChecking=no -r -P {ssh_port} {src_directory} root@{ssh_host}:{args.copy_dest}"
-    print(f"Running command: {scp_cmd}")
-    
-    returncode, stdout, stderr = run_command(scp_cmd)
-    if stdout:
-        print("stdout:", stdout)
-    if stderr:
-        print("stderr:", stderr)
-    
-    if returncode != 0:
-        print(f"Error copying files (return code: {returncode})")
-        return 1
-    # instance_id = 14477533
-
-
-    while True:
-        url = apiurl(args, "/instances", {"owner": "me"})
-        r = http_get(args, url)
-        r.raise_for_status()
-        instances = r.json()["instances"]
-        instance = next((i for i in instances if i["id"] == instance_id), None)
-        if instance and instance.get("actual_status") == "running":
-            ssh_host = instance.get("public_ipaddr")
-            for port_mapping in instance.get("ports", {}).get("22/tcp", []):
-                if port_mapping.get("HostIp") == "0.0.0.0":
-                    ssh_port = port_mapping.get("HostPort")
-                    break
-            if ssh_host and ssh_port:
-                break
-        time.sleep(5)
-
-    print(f"Instance ready at {ssh_host}:{ssh_port}")
     time.sleep(5)
-    # Transfer files using scp
-    print(f"Copying files to instance...")
-    scp_cmd = f"scp -o StrictHostKeyChecking=no -r -P {ssh_port} {src_directory} root@{ssh_host}:{args.copy_dest}"
-    returncode, stdout, stderr = run_command(scp_cmd)
+    # Create the destination directory if it doesn't exist
+    mkdir_cmd = f"ssh -o StrictHostKeyChecking=no -p {ssh_port} root@{ssh_host} 'mkdir -p /'"
+    returncode, stdout, stderr = run_command(mkdir_cmd)
     if returncode != 0:
-        print(f"Error copying files: {stderr}")
+        print(f"Error creating destination directory: {stderr}")
         return 1
 
-    # Check for docker compose and install if needed
-    if os.path.exists(compose_path):
-        print("Checking for docker compose...")
-        check_compose_cmd = f"ssh -o StrictHostKeyChecking=no -p {ssh_port} root@{ssh_host} 'docker compose version || (apt-get update && apt-get install -y docker-compose-v2)'"
-        returncode, stdout, stderr = run_command(check_compose_cmd)
-        if returncode != 0:
-            print("Installing docker compose...")
-            if stderr:
-                print(stderr)
-            if stdout:
-                print(stdout)
-            
-    # Build and run using ssh
-    if os.path.exists(compose_path):
-        cmd = f"cd {args.copy_dest} && docker-compose up -d"
-    else:
-        # If we have detected ports, map them all
-        port_flags = " ".join([f"-p {port}:{port}" for port in ports]) if ports else ""
-        cmd = f"cd {args.copy_dest} && docker build -t app . && docker run -d {port_flags} app"
+    # Transfer files using rsync
+    if not transfer_files_rsync(src_directory, ssh_host, ssh_port, src_directory):
+        print("Failed to transfer files")
+        return 1
 
+    # Install Docker Compose if needed
+    if os.path.exists(compose_path):
+        print("Setting up Docker Compose...")
+        if not install_docker_compose(ssh_host, ssh_port):
+            print("Failed to set up Docker Compose")
+            return 1
+
+    # Build and run using ssh
+    project_name = os.path.basename(src_directory)
+    if os.path.exists(compose_path):
+        # First, determine which docker compose command works
+        test_cmd = f"ssh -o StrictHostKeyChecking=no -p {ssh_port} root@{ssh_host} 'docker compose version >/dev/null 2>&1 || docker-compose --version >/dev/null 2>&1'"
+        returncode, _, _ = run_command(test_cmd)
+        
+        # Choose the appropriate command based on what's available
+        if returncode == 0:
+            # Try modern syntax first, fall back to legacy if needed
+            cmd = f"cd {src_directory} && (docker compose up -d || docker-compose up -d)"
+        else:
+            print("Warning: Neither docker compose nor docker-compose seems to be working properly")
+            return 1
+            
+        print(f"Running Docker Compose: {cmd}")
+    else:
+        cmd = f"cd {src_directory} && docker build -t app . && docker run -d app"
+        print(f"Running Docker build/run: {cmd}")
     ssh_cmd = f"ssh -o StrictHostKeyChecking=no -p {ssh_port} root@{ssh_host} '{cmd}'"
     returncode, stdout, stderr = run_command(ssh_cmd)
-
     
     if stderr:
         print("Errors during build/run:")
@@ -1336,20 +1544,9 @@ def magic_build(args):
     print("\nDeployment complete!")
     print(f"Instance ID: {instance_id}")
     print(f"SSH access: ssh -p {ssh_port} root@{ssh_host}")
-    
-    # Print all exposed port URLs
-    print("\nExposed ports:")
-    for port_key, mappings in instance.get("ports", {}).items():
-        container_port = port_key.split('/')[0]
-        protocol = "udp://" if "udp" in port_key.lower() else "http://"
-        
-        for mapping in mappings:
-            if mapping.get("HostIp") == "0.0.0.0":
-                host_port = mapping.get("HostPort")
-                url = f"{protocol}{ssh_host}:{host_port}"
-                print(f"  Container port {container_port} -> {url}")
 
     return 0
+
 
 @parser.command(
     argument("instance_id", help="id of instance to attach to", type=int),
